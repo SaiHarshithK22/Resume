@@ -1,0 +1,43 @@
+{
+  "selected_jobs": [
+    {
+      "rank": 1,
+      "title": "Software Engineer -- Entry Level",
+      "company": "CGI Technologies and Solutions, Inc.",
+      "url": "https://jobs.digitalhire.com/job-listing/opening/27sfDjvRkne5i4fK8kjzHa?utm_campaign=google_jobs_apply&utm_source=google_jobs_apply&utm_medium=organic",
+      "why": "Skill match 24% | Sponsorship: UNKNOWN",
+      "priority": "high"
+    },
+    {
+      "rank": 2,
+      "title": "Remote Aws Developer (Junior/ Entry Level)",
+      "company": "SynergisticIT",
+      "url": "https://jobs.digitalhire.com/job-listing/opening/1PvovC1Fkv76qEwSKqj4ih?utm_campaign=google_jobs_apply&utm_source=google_jobs_apply&utm_medium=organic",
+      "why": "Skill match 12% | Sponsorship: YES",
+      "priority": "high"
+    }
+  ],
+  "apply_strategy": [
+    "1. Filter all job postings to those published within the last 24 hours.",
+    "2. Exclude roles that do not mention OPT/CPT/H-1B sponsorship or have unknown sponsorship status.",
+    "3. Prioritize positions requiring 0\u20113 years of experience and that are explicitly entry\u2011level or junior.",
+    "4. Rank remaining jobs by relevance to AI, Generative AI, Machine Learning, or Data Science (keywords in title/description).",
+    "5. From the top\u2011ranked jobs, select 30\u201150 positions that meet all criteria for today\u2019s apply list.",
+    "6. Customize each application email using the provided email pitch template and insert role\u2011specific details.",
+    "7. Track applications in a spreadsheet with columns: Company, Role, URL, Date Applied, Follow\u2011up Date."
+  ],
+  "email_pitch": "Subject: Application for [Job Title] \u2013 International Master's Student (OPT/CPT Eligible)\n\nDear Hiring Team,\n\nI am excited to apply for the [Job Title] position at [Company]. I am currently completing my Master\u2019s in Computer Science in the United States and am eligible for OPT/CPT sponsorship. My academic projects and internships have equipped me with hands\u2011on experience in AI/ML, data analysis, and software development using Python, TensorFlow, and cloud platforms such as AWS.\n\nI am eager to contribute my strong analytical skills and passion for innovative technology to your team. Thank you for considering my application. I look forward to the opportunity to discuss how my background aligns with your needs.\n\nBest regards,\n[Your Name]\n[Phone] | [Email] | LinkedIn: [URL]",
+  "resume_keywords": [
+    "Python",
+    "Machine Learning",
+    "Data Science",
+    "TensorFlow",
+    "PyTorch",
+    "AWS",
+    "SQL",
+    "Statistical Modeling",
+    "Data Visualization",
+    "OPT",
+    "CPT"
+  ]
+}

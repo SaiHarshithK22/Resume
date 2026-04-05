@@ -1,19 +1,22 @@
 """
-        ATS Resume Builder — Gemini (2-agent) + Streamlit
-        =================================================
-        Same resume/cover/email output as cursor_v2.py, but uses Google Gemini API.
+ATS Resume Builder — Gemini dual-model pipeline (extraction + assembler), 8 LangChain steps + Streamlit
+======================================================================================================
+Wave 1 (parallel): Keywords, Skills Gap
+Wave 2 (parallel): Summary, Skills, Projects, Experience
+Wave 3 (parallel): Cold Email, Cover Letter
 
-        Architecture (cost-optimized for ~$10/month):
-        - Agent 1: ATS keyword extraction + skills gap (one JSON)
-        - Agent 2: Summary, skills, relevant experience, projects, cold email, cover letter (one JSON)
+Improvements over v1:
+- Education section with bold institution names and right-aligned dates
+- Enhanced prompts targeting >90% ATS score on Jobscan
+- Triple keyword coverage (summary + skills + bullets)
+- Post-assembly keyword verification & injection
+- Visual formatting matched to reference layout
 
-        Models (fixed): Agent 1 = gemini-2.5-flash-lite (ATS keywords + gap); Agent 2 =
-        gemini-2.5-flash (resume + email + cover). Target: ~35 tailored runs/day within a ~$10/mo budget.
-
-        Run:
-        pip install streamlit langchain-google-genai langchain-core python-docx python-dotenv
-        set GOOGLE_API_KEY=your_key_here
-        streamlit run cursor_gemini.py
+Run:
+  pip install streamlit langchain-google-genai langchain-core python-docx python-dotenv
+  set GOOGLE_API_KEY=your_key_here
+  Optional: set GEMINI_EXTRACTION_MODEL and GEMINI_ASSEMBLER_MODEL (or GEMINI_MODEL as default for both).
+  streamlit run cursor_gemini.py
 """
 
 from __future__ import annotations
@@ -22,17 +25,20 @@ import io
 import json
 import os
 import re
+import time
 import zipfile
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-
+from dotenv import load_dotenv
 from docx import Document as DocxDocument
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
+
+load_dotenv()
 
 import streamlit as st
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -42,56 +48,38 @@ from langchain_core.prompts import ChatPromptTemplate
 # ── Config ────────────────────────────────────────────────────────────────────
 
 # Google AI Studio / Gemini: use GOOGLE_API_KEY or GEMINI_API_KEY
-from dotenv import load_dotenv
-load_dotenv()
 GEMINI_API_KEY = (
     os.environ.get("GOOGLE_API_KEY", "").strip()
     or os.environ.get("GEMINI_API_KEY", "").strip()
 )
-# Default: 2.5 Flash-Lite is the most budget-friendly in the current Gemini family (see Google docs).
-DEFAULT_AGENT1_MODEL = "gemini-2.5-flash-lite"
-DEFAULT_AGENT2_MODEL = "gemini-2.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# GEMINI_MODEL: default when GEMINI_EXTRACTION_MODEL / GEMINI_ASSEMBLER_MODEL are not set
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", _DEFAULT_GEMINI_MODEL).strip()
+# Extraction: ATS keywords + skills gap (steps 1–2). Assembler: summary → cover (steps 3–8).
+GEMINI_EXTRACTION_MODEL = os.environ.get("GEMINI_EXTRACTION_MODEL", GEMINI_MODEL).strip()
+GEMINI_ASSEMBLER_MODEL = os.environ.get("GEMINI_ASSEMBLER_MODEL", GEMINI_MODEL).strip()
 
-# Budget guardrails (~$10/month, ~35 runs/day target ≈ 1050 runs/month)
-MONTHLY_BUDGET_USD = 10.0
-RUNS_PER_DAY_TARGET = 35
-# Fallback if model is unknown (conservative)
-EST_USD_PER_AGENT_CALL_DEFAULT = 0.005
-USAGE_FILE = os.path.join(os.path.dirname(__file__) or ".", ".gemini_resume_usage.json")
-
-# Cost hints for the fixed Agent 1 + Agent 2 pair (est. $ per single agent call).
-# Real billing is token-based — adjust after you see Google AI Studio → Usage.
-# See: https://ai.google.dev/gemini-api/docs/pricing
-GEMINI_MODEL_PRESETS: List[Tuple[str, str, float]] = [
-    ("gemini-2.5-flash-lite", "gemini-2.5-flash-lite", 0.003),
-    ("gemini-2.5-flash", "gemini-2.5-flash", 0.006),
+# Sidebar catalog (IDs must match Google AI / Gemini API). Unknown env models are prepended in the UI.
+GEMINI_MODEL_CATALOG: List[str] = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 
-def _preset_cost_per_call(model_id: str) -> float:
-    mid = (model_id or "").strip().lower()
-    for _label, preset_id, est in GEMINI_MODEL_PRESETS:
-        if preset_id.lower() == mid:
-            return est
-    # Partial match for aliases
-    if "flash-lite" in mid and "preview" not in mid:
-        return 0.003
-    if "2.5-flash" in mid and "lite" not in mid and "pro" not in mid:
-        return 0.006
-    if "2.5-pro" in mid:
-        return 0.022
-    if "3.1-pro" in mid or "3-pro" in mid:
-        return 0.045
-    if "flash" in mid and "preview" in mid:
-        return 0.008
-    if "2.0-flash" in mid:
-        return 0.004
-    return EST_USD_PER_AGENT_CALL_DEFAULT
+def _gemini_select_options(current: str) -> List[str]:
+    opts = list(GEMINI_MODEL_CATALOG)
+    if current and current not in opts:
+        opts.insert(0, current)
+    return opts
 
 
-def estimate_two_agent_run_usd(agent1_model: str, agent2_model: str) -> float:
-    """Rough cost for one full resume generation (2 LLM calls)."""
-    return _preset_cost_per_call(agent1_model) + _preset_cost_per_call(agent2_model)
+def _gemini_select_index(options: List[str], current: str) -> int:
+    try:
+        return options.index(current)
+    except ValueError:
+        return 0
 
 
 C_BLACK = RGBColor(0x00, 0x00, 0x00)
@@ -345,13 +333,13 @@ NO — do NOT extract these:
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"job_title": "exact job title from JD",
-"jd_keywords": ["all real keywords — tools, technologies, methodologies, skills"],
-"matched": ["keywords already in resume"],
-"missing": ["keywords NOT in resume that should be added"],
-"for_summary": ["top 8-10 technical keywords for the summary"],
-"for_skills": ["tools, languages, frameworks, platforms, methodologies, and soft skills ONLY"],
-"for_bullets": ["technical terms and action verbs to use in project bullets"]
+  "job_title": "exact job title from JD",
+  "jd_keywords": ["all real keywords — tools, technologies, methodologies, skills"],
+  "matched": ["keywords already in resume"],
+  "missing": ["keywords NOT in resume that should be added"],
+  "for_summary": ["top 8-10 technical keywords for the summary"],
+  "for_skills": ["tools, languages, frameworks, platforms, methodologies, and soft skills ONLY"],
+  "for_bullets": ["technical terms and action verbs to use in project bullets"]
 }}
 
 JOB DESCRIPTION:
@@ -365,12 +353,12 @@ PROMPT_SKILLS_GAP = """You are a senior technical recruiter performing a skills 
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"required_skills": ["skill"],
-"candidate_has": ["skill"],
-"gaps": [
+  "required_skills": ["skill"],
+  "candidate_has": ["skill"],
+  "gaps": [
     {{"skill": "", "importance": "Critical|Important|Nice-to-have", "suggestion": "how to address in resume"}}
-],
-"transferable": ["candidate skill that substitutes for a gap"]
+  ],
+  "transferable": ["candidate skill that substitutes for a gap"]
 }}
 
 JOB DESCRIPTION:
@@ -391,18 +379,18 @@ KEYWORDS TO EMBED (use exact phrasing):
 
 Rules:
 1. First sentence MUST start with: "{job_title} with X+ years of hands-on experience in"
-followed by the top 3-4 JD keywords.
+   followed by the top 3-4 JD keywords.
 2. Use the EXACT JD phrasing, not synonyms. If JD says "large-scale", write "large-scale".
 3. Reference 2-3 quantified achievements from the resume (never invent metrics).
 4. Write 3-4 sentences, one paragraph, no bullets.
 5. No first person ("I am"), no clichés ("passionate", "hard-working").
 6. Each sentence should contain 2-3 JD keywords, woven in naturally — the summary must read
-like a human wrote it, not like a keyword list.
+   like a human wrote it, not like a keyword list.
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"optimized_summary": "rewritten summary (3-4 sentences)",
-"keywords_embedded": ["JD keywords you used"]
+  "optimized_summary": "rewritten summary (3-4 sentences)",
+  "keywords_embedded": ["JD keywords you used"]
 }}
 
 JOB DESCRIPTION:
@@ -422,7 +410,7 @@ INCLUDE ONLY:
 - Programming languages (Python, SQL, Java, Go, C++)
 - Named ML/DL libraries and algorithms (scikit-learn, PyTorch, XGBoost, ResNet, SMOTE)
 - Named AI/LLM tools and concepts (LangChain, RAG, FAISS, ChromaDB, prompt engineering,
-function calling, vector retrieval, embeddings, fine-tuning, agent architectures)
+  function calling, vector retrieval, embeddings, fine-tuning, agent architectures)
 - Named AI models (OpenAI, Gemini, Llama, Qwen, Claude)
 - Named frameworks and dev tools (FastAPI, Streamlit, Git, Docker, REST APIs)
 - Named cloud services (AWS, S3, EC2, Lambda, SageMaker, ECS/EKS, DynamoDB, Terraform)
@@ -442,13 +430,13 @@ Rules:
 - Format: "Category: item1, item2, item3" (one row per category).
 - Use the JD's EXACT spellings.
 - Group into: Languages, ML / DL, Generative AI / LLMs, Frameworks / Tools,
-Cloud / Infrastructure, Analytics / Visualization, Soft Skills (if JD mentions any).
+  Cloud / Infrastructure, Analytics / Visualization, Soft Skills (if JD mentions any).
 - Each category row should have real, recognizable skills — not sentences or phrases.
 - Keep each row concise and scannable.
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"skills_lines": [
+  "skills_lines": [
     "Languages: ...",
     "ML / DL: ...",
     "Generative AI / LLMs: ...",
@@ -456,7 +444,7 @@ Return ONLY valid JSON (no markdown fences):
     "Cloud / Infrastructure: ...",
     "Analytics / Visualization: ...",
     "Soft Skills: ... (only if JD has soft skills)"
-]
+  ]
 }}
 
 JOB DESCRIPTION:
@@ -487,9 +475,9 @@ ProjectName | TechStack | Link                DateRange
 1. Keep project names, tech stacks, and date ranges EXACTLY as in the resume.
 2. Start EVERY bullet with a strong action verb.
 3. Each bullet should include 1-2 JD keywords WHERE THEY NATURALLY FIT.
-Do NOT force keywords that make the bullet unreadable.
+   Do NOT force keywords that make the bullet unreadable.
 4. PRESERVE the original meaning of each bullet — describe what the project ACTUALLY does.
-Do NOT fabricate capabilities the project doesn't have.
+   Do NOT fabricate capabilities the project doesn't have.
 5. Preserve ALL original metrics, numbers, percentages. Never invent metrics.
 6. Each project: 4-5 bullets. Rewrite existing bullets; do not add imaginary ones.
 7. Do NOT include Education or Certifications.
@@ -500,7 +488,7 @@ Do NOT fabricate capabilities the project doesn't have.
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"projects_text": "full plain-text PROJECTS block following the format above"
+  "projects_text": "full plain-text PROJECTS block following the format above"
 }}
 
 JOB DESCRIPTION:
@@ -537,7 +525,7 @@ Job Title | Company Name                DateRange
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"experience_text": "full plain-text WORK EXPERIENCE block following the format above"
+  "experience_text": "full plain-text WORK EXPERIENCE block following the format above"
 }}
 
 JOB DESCRIPTION:
@@ -575,7 +563,7 @@ Title | Organization                DateRange
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"relevant_exp_text": "full plain-text RELEVANT EXPERIENCE block following the format above"
+  "relevant_exp_text": "full plain-text RELEVANT EXPERIENCE block following the format above"
 }}
 
 JOB DESCRIPTION:
@@ -596,9 +584,9 @@ Rules:
 1. Subject line: mention the exact job title + be curiosity-driving (not generic).
 2. Opening: reference something specific from the company or JD — NOT "I saw your job posting".
 3. Body: 2 short paragraphs max.
-- Para 1: who the candidate is + ONE most impressive quantified achievement from the resume
-    that maps directly to the JD's top requirement.
-- Para 2: why THIS company specifically (reference their product, mission, or tech stack from JD).
+   - Para 1: who the candidate is + ONE most impressive quantified achievement from the resume
+     that maps directly to the JD's top requirement.
+   - Para 2: why THIS company specifically (reference their product, mission, or tech stack from JD).
 4. CTA: one clear, low-friction ask (15-minute call, not "please review my resume").
 5. Tone: confident, direct, human — NOT corporate or sycophantic.
 6. Total length: under 150 words (excluding subject line).
@@ -606,8 +594,8 @@ Rules:
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"subject_line": "...",
-"email_body": "full email text including sign-off"
+  "subject_line": "...",
+  "email_body": "full email text including sign-off"
 }}
 
 JOB DESCRIPTION:
@@ -627,27 +615,27 @@ Rules:
 2. Date: use today's date.
 3. Salutation: "Dear Hiring Manager," (unless a specific name is in the JD).
 4. Paragraph 1 — Hook (2-3 sentences):
-- State the exact job title from the JD.
-- Lead with the candidate's single strongest quantified achievement from the resume
-    that maps directly to the JD's top requirement.
-- Do NOT start with "I am writing to apply..."
+   - State the exact job title from the JD.
+   - Lead with the candidate's single strongest quantified achievement from the resume
+     that maps directly to the JD's top requirement.
+   - Do NOT start with "I am writing to apply..."
 5. Paragraph 2 — Fit (3-4 sentences):
-- Highlight 2-3 specific technical skills or project results from the resume.
-- Use EXACT keywords from the JD naturally.
-- Reference a specific project name and metric from the resume.
+   - Highlight 2-3 specific technical skills or project results from the resume.
+   - Use EXACT keywords from the JD naturally.
+   - Reference a specific project name and metric from the resume.
 6. Paragraph 3 — Motivation (2-3 sentences):
-- Why THIS company specifically — reference their mission, product, or tech stack from the JD.
-- Connect the candidate's career direction to what they're building.
+   - Why THIS company specifically — reference their mission, product, or tech stack from the JD.
+   - Connect the candidate's career direction to what they're building.
 7. Closing paragraph (2 sentences):
-- Express enthusiasm, mention the enclosed resume.
-- Clear CTA: looking forward to discussing how you can contribute.
+   - Express enthusiasm, mention the enclosed resume.
+   - Clear CTA: looking forward to discussing how you can contribute.
 8. Sign-off: "Sincerely," followed by candidate's full name.
 9. Tone: confident, specific, professional — no clichés like "passionate team player".
 10. Total length: 300-380 words.
 
 Return ONLY valid JSON (no markdown fences):
 {{
-"cover_letter_text": "full formatted cover letter including header and sign-off"
+  "cover_letter_text": "full formatted cover letter including header and sign-off"
 }}
 
 JOB DESCRIPTION:
@@ -655,90 +643,6 @@ JOB DESCRIPTION:
 
 OPTIMIZED RESUME:
 {optimized_resume}
-"""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2-AGENT GEMINI PROMPTS (single call each — minimizes API cost vs 8 sequential calls)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-PROMPT_AGENT1_ATS = """You are two specialists in one response: (A) ATS keyword analyst, (B) skills gap analyst.
-
-Part A — same rules as expert ATS extraction:
-- YES: languages, tools, frameworks, cloud, ML/AI terms, methodologies, soft skills from JD
-- NO: hours, degree names, company names, generic business phrases
-
-Part B — skills gap: required vs candidate, gaps with suggestions, transferable skills.
-
-Return ONLY valid JSON (no markdown fences):
-{{
-"job_title": "exact job title from JD",
-"jd_keywords": [],
-"matched": [],
-"missing": [],
-"for_summary": [],
-"for_skills": [],
-"for_bullets": [],
-"gap_analysis": {{
-    "required_skills": [],
-    "candidate_has": [],
-    "gaps": [{{"skill": "", "importance": "Critical|Important|Nice-to-have", "suggestion": ""}}],
-    "transferable": []
-}}
-}}
-
-JOB DESCRIPTION:
-{jd}
-
-RESUME:
-{resume}
-"""
-
-PROMPT_AGENT2_RESUME_PACKAGE = """You are an expert ATS resume writer + outreach writer. Maximize Jobscan-style keyword match
-without stuffing. Use EXACT JD phrasing where listed below. Never invent metrics or experience.
-
-KEYWORD CONTEXT (from prior analysis):
-job_title: {job_title}
-for_summary (embed naturally): {for_summary}
-for_skills (technical skills section): {for_skills}
-for_bullets (projects/relevant exp): {for_bullets}
-missing_keywords (add only where natural): {missing_keywords}
-
-Follow the SAME formatting and rules as these templates:
-
-SUMMARY: First sentence MUST start with the exact job_title below, e.g. "{job_title} with 1+ years of hands-on experience in" (use 2+ for master's/project experience). 3-4 sentences, JD keywords woven naturally.
-
-TECHNICAL SKILLS: Categories — Languages, ML/DL, Generative AI/LLMs, Frameworks/Tools, Cloud, Analytics, Soft Skills (if JD). Only real skills; no junk phrases.
-
-RELEVANT EXPERIENCE (if none in resume, use empty string):
-Title | Org                DateRange
-• bullets with action verbs, 1-2 JD terms per bullet, preserve real metrics
-
-PROJECTS — CRITICAL FORMAT per project:
-ProjectName | TechStack | Link                DateRange
-• bullet
-(4-5 bullets per project; preserve names/dates/links; fix_project_bullets style)
-
-EMAIL: subject + body per cold-email rules; under 150 words body; sign-off from resume.
-
-COVER: 300-380 words; header from resume; Dear Hiring Manager; JD keywords naturally.
-
-Return ONLY valid JSON (no markdown fences):
-{{
-"optimized_summary": "paragraph",
-"skills_lines": ["Languages: ...", "..."],
-"relevant_exp_text": "block or empty",
-"projects_text": "full PROJECTS block",
-"subject_line": "",
-"email_body": "",
-"cover_letter_text": ""
-}}
-
-JOB DESCRIPTION:
-{jd}
-
-RESUME:
-{resume}
 """
 
 
@@ -790,21 +694,21 @@ def _keyword_category_hints(kw: str) -> List[str]:
     if any(t in kw for t in ["python", "java", "go ", "c++", "c/c++", "sql", "javascript"]):
         return ["language"]
     if any(t in kw for t in ["llm", "gpt", "genai", "rag", "prompt", "agent", "lam", "openai",
-                            "gemini", "llama", "claude", "qwen", "foundational model"]):
+                               "gemini", "llama", "claude", "qwen", "foundational model"]):
         return ["generative", "llm", "ai"]
     if any(t in kw for t in ["ml", "machine learning", "deep learning", "model", "neural",
-                            "classification", "regression", "anomaly", "predictive",
-                            "time-series", "forecasting", "statistical"]):
+                               "classification", "regression", "anomaly", "predictive",
+                               "time-series", "forecasting", "statistical"]):
         return ["ml", "dl", "machine"]
     if any(t in kw for t in ["aws", "s3", "ec2", "lambda", "sagemaker", "ecs", "eks",
-                            "terraform", "cloud", "docker", "container", "serverless"]):
+                               "terraform", "cloud", "docker", "container", "serverless"]):
         return ["cloud", "infrastructure"]
     if any(t in kw for t in ["pandas", "numpy", "fastapi", "streamlit", "flask", "django",
-                            "pytorch", "tensorflow", "scikit", "git", "docker"]):
+                               "pytorch", "tensorflow", "scikit", "git", "docker"]):
         return ["framework", "tool"]
     if any(t in kw for t in ["ownership", "communication", "collaboration", "leadership",
-                            "problem-solving", "teamwork", "urgency", "mentoring",
-                            "analytical", "cross-functional"]):
+                               "problem-solving", "teamwork", "urgency", "mentoring",
+                               "analytical", "cross-functional"]):
         return ["soft"]
     return ["additional", "framework", "tool"]
 
@@ -877,97 +781,56 @@ def assemble_resume(
     return normalize("\n".join(parts))
 
 
-# ── Pipeline (Gemini — 2 LLM calls: Agent 1 ATS + Agent 2 resume package) ────
+# ── Pipeline (sequential; spacing helps avoid burst rate limits) ──────────────
+
+DELAY_BETWEEN_CALLS = 3  # seconds between LLM calls
 
 
-def _usage_load() -> Dict:
-    try:
-        if os.path.isfile(USAGE_FILE):
-            with open(USAGE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-
-def _usage_save(data: Dict) -> None:
-    try:
-        with open(USAGE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
-
-
-def _month_key() -> str:
-    return datetime.now().strftime("%Y-%m")
-
-
-def check_monthly_budget(next_run_cost_usd: float | None = None) -> Tuple[bool, str, Dict]:
-    """Returns (ok, message, usage_record). Uses dynamic cost when next_run_cost_usd is set."""
-    usage = _usage_load()
-    mk = _month_key()
-    if usage.get("month") != mk:
-        usage = {"month": mk, "runs": 0, "estimated_usd": 0.0}
-    spent = float(usage.get("estimated_usd", 0.0))
-    runs = int(usage.get("runs", 0))
-    step = next_run_cost_usd if next_run_cost_usd is not None else estimate_two_agent_run_usd(
-        DEFAULT_AGENT1_MODEL, DEFAULT_AGENT2_MODEL
-    )
-    if spent + step > MONTHLY_BUDGET_USD:
-        return False, f"Monthly budget ${MONTHLY_BUDGET_USD} reached (~${spent:.2f} estimated). Runs: {runs}.", usage
-    return True, "", usage
-
-
-def _make_gemini_llm(model: str, max_output_tokens: int) -> ChatGoogleGenerativeAI:
+def _make_gemini_llm(model: str) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
         model=model,
         google_api_key=GEMINI_API_KEY,
         temperature=0.0,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=4096,
     )
 
 
-def _invoke_gemini(prompt_template: str, llm: ChatGoogleGenerativeAI, variables: dict) -> str:
-    parser = StrOutputParser()
+def _invoke_chain(prompt_template: str, llm, parser, variables: dict) -> str:
     chain = ChatPromptTemplate.from_template(prompt_template) | llm | parser
-    return chain.invoke(variables)
+    result = chain.invoke(variables)
+    time.sleep(DELAY_BETWEEN_CALLS)
+    return result
 
 
 def run_pipeline(
     resume: str,
     jd: str,
-    agent1_model: str | None = None,
-    agent2_model: str | None = None,
-    skip_budget_check: bool = False,
+    *,
+    extraction_model: str | None = None,
+    assembler_model: str | None = None,
 ) -> Dict:
     if not GEMINI_API_KEY:
         raise ValueError("Set GOOGLE_API_KEY or GEMINI_API_KEY for Gemini.")
-
-    m1 = agent1_model or DEFAULT_AGENT1_MODEL
-    m2 = agent2_model or DEFAULT_AGENT2_MODEL
-    run_cost = estimate_two_agent_run_usd(m1, m2)
-
-    if not skip_budget_check:
-        ok, msg, usage = check_monthly_budget(next_run_cost_usd=run_cost)
-        if not ok:
-            raise ValueError(msg)
-
-    llm1 = _make_gemini_llm(m1, 4096)
-    llm2 = _make_gemini_llm(m2, 8192)
-
+    ex_id = (extraction_model or GEMINI_EXTRACTION_MODEL).strip()
+    asm_id = (assembler_model or GEMINI_ASSEMBLER_MODEL).strip()
+    llm_extract = _make_gemini_llm(ex_id)
+    llm_assemble = _make_gemini_llm(asm_id)
+    parser = StrOutputParser()
     base = {"resume": resume, "jd": jd}
 
-    # ── Agent 1: ATS keywords + gap ───────────────────────────────────
-    a1_raw = _invoke_gemini(PROMPT_AGENT1_ATS, llm1, base)
-    kw = safe_json(a1_raw)
+    # ── Step 1: Keyword analysis ─────────────────────────────────────
+    kw_raw = _invoke_chain(PROMPT_KEYWORDS, llm_extract, parser, base)
+    kw = safe_json(kw_raw)
 
-    job_title = (kw.get("job_title") or "").strip()
-    for_summary = ", ".join(kw.get("for_summary") or kw.get("jd_keywords", [])[:15])
-    for_skills = ", ".join(kw.get("for_skills") or kw.get("jd_keywords", []))
-    for_bullets = ", ".join(kw.get("for_bullets") or kw.get("jd_keywords", []))
-    missing_list = kw.get("missing", []) or []
-    missing_kws = ", ".join(missing_list)
+    # ── Step 2: Skills gap (uses same inputs) ────────────────────────
+    _invoke_chain(PROMPT_SKILLS_GAP, llm_extract, parser, base)
 
+    job_title = kw.get("job_title", "")
+    for_summary = ", ".join(kw.get("for_summary", kw.get("jd_keywords", [])[:15]))
+    for_skills = ", ".join(kw.get("for_skills", kw.get("jd_keywords", [])))
+    for_bullets = ", ".join(kw.get("for_bullets", kw.get("jd_keywords", [])))
+    missing_kws = ", ".join(kw.get("missing", []))
+    missing_list = kw.get("missing", [])
     w2_vars = {
         **base,
         "job_title": job_title,
@@ -977,44 +840,36 @@ def run_pipeline(
         "missing_keywords": missing_kws,
     }
 
-    # ── Agent 2: Full resume + email + cover (single JSON) ──────────
-    a2_raw = _invoke_gemini(PROMPT_AGENT2_RESUME_PACKAGE, llm2, w2_vars)
-    pkg = safe_json(a2_raw)
+    # ── Step 3: Summary ──────────────────────────────────────────────
+    sm = safe_json(_invoke_chain(PROMPT_SUMMARY, llm_assemble, parser, w2_vars))
 
-    sm = {"optimized_summary": pkg.get("optimized_summary", "")}
-    sk = {"skills_lines": pkg.get("skills_lines", [])}
-    re_exp = {"relevant_exp_text": pkg.get("relevant_exp_text", "")}
-    pr = {"projects_text": pkg.get("projects_text", "")}
-    em = {"subject_line": pkg.get("subject_line", ""), "email_body": pkg.get("email_body", "")}
-    cv = {"cover_letter_text": pkg.get("cover_letter_text", "")}
+    # ── Step 4: Skills ───────────────────────────────────────────────
+    sk = safe_json(_invoke_chain(PROMPT_SKILLS, llm_assemble, parser, w2_vars))
+
+    # ── Step 5: Relevant Experience ──────────────────────────────────
+    re_exp = safe_json(_invoke_chain(PROMPT_RELEVANT_EXP, llm_assemble, parser, w2_vars))
+
+    # ── Step 6: Projects ─────────────────────────────────────────────
+    pr = safe_json(_invoke_chain(PROMPT_PROJECTS, llm_assemble, parser, w2_vars))
 
     resume_text = assemble_resume(
-        resume,
-        sm,
-        sk,
-        pr,
+        resume, sm, sk, pr,
         relevant_exp=re_exp,
         job_title=job_title,
         missing_keywords=missing_list,
     )
 
-    # ── Persist usage estimate ───────────────────────────────────────
-    usage = _usage_load()
-    mk = _month_key()
-    if usage.get("month") != mk:
-        usage = {"month": mk, "runs": 0, "estimated_usd": 0.0}
-    usage["runs"] = int(usage.get("runs", 0)) + 1
-    usage["estimated_usd"] = float(usage.get("estimated_usd", 0.0)) + run_cost
-    usage["last_model_agent1"] = m1
-    usage["last_model_agent2"] = m2
-    _usage_save(usage)
+    # ── Step 7: Cold Email ───────────────────────────────────────────
+    w3_vars = {"optimized_resume": resume_text, "jd": jd}
+    em = safe_json(_invoke_chain(PROMPT_EMAIL, llm_assemble, parser, w3_vars))
+
+    # ── Step 8: Cover Letter ─────────────────────────────────────────
+    cv = safe_json(_invoke_chain(PROMPT_COVER, llm_assemble, parser, w3_vars))
 
     return {
         "resume_text": resume_text,
         "email_data": em,
         "cover_data": cv,
-        "keyword_analysis": kw,
-        "usage": usage,
     }
 
 
@@ -1346,80 +1201,52 @@ def build_zip(r: bytes, c: bytes, e: bytes, ts: str) -> bytes:
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="ATS Resume Builder (Gemini)", page_icon="📄", layout="wide")
-st.markdown("## 📄 ATS Resume Builder — Gemini (2 agents)")
-
-_usage = _usage_load()
-_mk = _month_key()
-if _usage.get("month") != _mk:
-    _usage = {"month": _mk, "runs": 0, "estimated_usd": 0.0}
-_spent = float(_usage.get("estimated_usd", 0.0))
-_runs = int(_usage.get("runs", 0))
-_remaining = max(0.0, MONTHLY_BUDGET_USD - _spent)
-st.caption(
-    f"Budget tracking (estimated): **${_spent:.2f} / ${MONTHLY_BUDGET_USD:.2f}** this month  •  "
-    f"Runs: **{_runs}**  •  ~**${_remaining:.2f}** remaining  •  Target **{RUNS_PER_DAY_TARGET}/day** "
-    f"(~{RUNS_PER_DAY_TARGET * 30} runs/month max)"
-)
-
-_est_run = estimate_two_agent_run_usd(DEFAULT_AGENT1_MODEL, DEFAULT_AGENT2_MODEL)
+st.markdown("## 📄 ATS Resume Builder (Gemini)")
 
 with st.sidebar:
-    st.subheader("Gemini models (fixed)")
-    st.markdown(
-        f"- **Agent 1** (ATS keywords & gap): `{DEFAULT_AGENT1_MODEL}`\n"
-        f"- **Agent 2** (resume + email + cover): `{DEFAULT_AGENT2_MODEL}`"
+    st.subheader("Gemini models")
+    st.caption(
+        "**Extraction** — ATS keywords + skills gap. **Assembler** — summary, skills, "
+        "experience, projects, cold email, cover letter."
     )
-    _max_runs_mo = int(MONTHLY_BUDGET_USD / _est_run) if _est_run > 0 else 0
-    st.metric("Est. cost / run (2 calls)", f"~${_est_run:.3f}")
-    st.caption(f"~{_max_runs_mo} runs possible on ${MONTHLY_BUDGET_USD:.0f}/mo at this combo (rough estimate).")
-
-    with st.expander("Budget tips ($10/mo)"):
-        st.markdown(
-            "- This app uses **Flash-Lite** for Agent 1 and **2.5 Flash** for Agent 2 — a common cost/quality balance.\n"
-            "- Real spend is token-based; check [pricing](https://ai.google.dev/gemini-api/docs/pricing) and **AI Studio → Usage**.\n"
-            "- Adjust the `$` estimates in `GEMINI_MODEL_PRESETS` if your usage looks off."
-        )
+    _ex_opts = _gemini_select_options(GEMINI_EXTRACTION_MODEL)
+    _asm_opts = _gemini_select_options(GEMINI_ASSEMBLER_MODEL)
+    extraction_model_ui = st.selectbox(
+        "Extraction model",
+        _ex_opts,
+        index=_gemini_select_index(_ex_opts, GEMINI_EXTRACTION_MODEL),
+    )
+    assembler_model_ui = st.selectbox(
+        "Assembler model",
+        _asm_opts,
+        index=_gemini_select_index(_asm_opts, GEMINI_ASSEMBLER_MODEL),
+    )
 
 if not GEMINI_API_KEY:
     st.error("Set **GOOGLE_API_KEY** or **GEMINI_API_KEY** in your `.env` or environment.")
-
-_budget_ok, _budget_msg, _ = check_monthly_budget(next_run_cost_usd=_est_run)
-if not _budget_ok:
-    st.warning(_budget_msg)
 
 c1, c2 = st.columns(2)
 with c1:
     up = st.file_uploader("Upload current resume (.docx)", type=["docx"])
 with c2:
-    jd = st.text_area(
-        "Job Description",
-        height=260,
-        placeholder="Paste the full job description here (about 400 words is typical)…",
-        help=(
-            "One JD per run. The two agents read this text to extract ATS keywords and tailor: "
-            "Professional Summary, Technical Skills, Relevant Experience, Projects, plus Cold Email and Cover Letter."
-        ),
-    )
-    if jd.strip():
-        _wc = len(jd.split())
-        st.caption(f"~{_wc} words — fine for ATS tailoring (300–800 words is common).")
+    jd = st.text_area("Job Description", height=260, placeholder="Paste the full JD here…")
 
 go = st.button(
     "🚀 Generate ATS Resume + Cover Letter + Cold Email",
     type="primary",
-    disabled=not (up and jd.strip() and GEMINI_API_KEY and _budget_ok),
+    disabled=not (up and jd.strip() and GEMINI_API_KEY),
 )
 
 if go and up and jd.strip():
-    with st.spinner("Running 2-agent Gemini pipeline (ATS analysis → tailored resume + outreach)…"):
+    with st.spinner("Running 8 steps (keywords → summary → skills → relevant exp → projects → email → cover)… ~2 min"):
         up.seek(0)
         resume_plain = extract_text_from_docx(up)
         try:
             out = run_pipeline(
                 resume_plain,
                 jd.strip(),
-                agent1_model=DEFAULT_AGENT1_MODEL,
-                agent2_model=DEFAULT_AGENT2_MODEL,
+                extraction_model=extraction_model_ui,
+                assembler_model=assembler_model_ui,
             )
         except Exception as e:
             st.error(str(e))
@@ -1472,12 +1299,3 @@ if go and up and jd.strip():
     ed = out["email_data"]
     st.text_input("Subject", value=ed.get("subject_line", ""), disabled=True)
     st.text_area("Body", value=ed.get("email_body", ""), height=200, disabled=True)
-
-    st.subheader("Cover Letter")
-    cv = out["cover_data"]
-    st.text_area(
-        "Cover letter text",
-        value=cv.get("cover_letter_text", ""),
-        height=320,
-        disabled=True,
-    )

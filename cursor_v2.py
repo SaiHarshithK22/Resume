@@ -1,5 +1,5 @@
 """
-ATS Resume Builder v2 — Enhanced 7 LangChain agents (Groq) + Streamlit
+ATS Resume Builder v2 — Groq dual-model pipeline (extraction + assembler), 8 LangChain steps + Streamlit
 =====================================================================
 Wave 1 (parallel): Keywords, Skills Gap
 Wave 2 (parallel): Summary, Skills, Projects, Experience
@@ -15,6 +15,7 @@ Improvements over v1:
 Run:
   pip install streamlit langchain-groq langchain-core python-docx python-dotenv
   set GROQ_API_KEY=your_key_here
+  Optional: set GROQ_EXTRACTION_MODEL and GROQ_ASSEMBLER_MODEL (or GROQ_MODEL as default for both).
   streamlit run cursor_v2.py
 """
 
@@ -48,7 +49,35 @@ from langchain_core.runnables import RunnableParallel  # kept for reference
 # ── Config ────────────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_MODEL = "moonshotai/kimi-k2-instruct"
+_DEFAULT_GROQ_MODEL = "moonshotai/kimi-k2-instruct"
+# GROQ_MODEL: default when GROQ_EXTRACTION_MODEL / GROQ_ASSEMBLER_MODEL are not set
+GROQ_MODEL = os.environ.get("GROQ_MODEL", _DEFAULT_GROQ_MODEL).strip()
+# Extraction: ATS keywords + skills gap (steps 1–2). Assembler: summary → cover (steps 3–8).
+GROQ_EXTRACTION_MODEL = os.environ.get("GROQ_EXTRACTION_MODEL", GROQ_MODEL).strip()
+GROQ_ASSEMBLER_MODEL = os.environ.get("GROQ_ASSEMBLER_MODEL", GROQ_MODEL).strip()
+
+# Sidebar catalog (IDs must match Groq Cloud). Unknown env models are prepended in the UI.
+GROQ_MODEL_CATALOG: List[str] = [
+    "moonshotai/kimi-k2-instruct",
+    "meta-llama/llama-3.3-70b-versatile",
+    "meta-llama/llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+]
+
+
+def _groq_select_options(current: str) -> List[str]:
+    opts = list(GROQ_MODEL_CATALOG)
+    if current and current not in opts:
+        opts.insert(0, current)
+    return opts
+
+
+def _groq_select_index(options: List[str], current: str) -> int:
+    try:
+        return options.index(current)
+    except ValueError:
+        return 0
+
 
 C_BLACK = RGBColor(0x00, 0x00, 0x00)
 C_DARK = RGBColor(0x1A, 0x1A, 0x1A)
@@ -58,7 +87,7 @@ C_GRAY = RGBColor(0x33, 0x33, 0x33)
 
 LINK_MAP: Dict[str, str] = {
     "linkedin": "https://www.linkedin.com/in/sai-harshith-kolavasi-69459a243/",
-    "github": "https://github.com/",
+    "github": "https://github.com/SaiHarshithK22",
     "email": "harshith.kolavasi@gmail.com",
     "research rag application": "https://saiharshithk22-research-rag-application-main-50zvlk.streamlit.app/",
     "vehicle damage detection system": "https://saiharshithk22-vehicle-damage-detection-app-7w2rdy.streamlit.app/",
@@ -754,6 +783,15 @@ def assemble_resume(
 DELAY_BETWEEN_CALLS = 3  # seconds between LLM calls to avoid TPM throttling
 
 
+def _make_groq_llm(model: str) -> ChatGroq:
+    return ChatGroq(
+        model=model,
+        api_key=GROQ_API_KEY,
+        temperature=0.0,
+        max_tokens=4096,
+    )
+
+
 def _invoke_chain(prompt_template: str, llm, parser, variables: dict) -> str:
     chain = ChatPromptTemplate.from_template(prompt_template) | llm | parser
     result = chain.invoke(variables)
@@ -761,24 +799,28 @@ def _invoke_chain(prompt_template: str, llm, parser, variables: dict) -> str:
     return result
 
 
-def run_pipeline(resume: str, jd: str) -> Dict:
+def run_pipeline(
+    resume: str,
+    jd: str,
+    *,
+    extraction_model: str | None = None,
+    assembler_model: str | None = None,
+) -> Dict:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not set.")
-    llm = ChatGroq(
-        model=GROQ_MODEL,
-        api_key=GROQ_API_KEY,
-        temperature=0.0,
-        max_tokens=4096,
-    )
+    ex_id = (extraction_model or GROQ_EXTRACTION_MODEL).strip()
+    asm_id = (assembler_model or GROQ_ASSEMBLER_MODEL).strip()
+    llm_extract = _make_groq_llm(ex_id)
+    llm_assemble = _make_groq_llm(asm_id)
     parser = StrOutputParser()
     base = {"resume": resume, "jd": jd}
 
     # ── Step 1: Keyword analysis ─────────────────────────────────────
-    kw_raw = _invoke_chain(PROMPT_KEYWORDS, llm, parser, base)
+    kw_raw = _invoke_chain(PROMPT_KEYWORDS, llm_extract, parser, base)
     kw = safe_json(kw_raw)
 
     # ── Step 2: Skills gap (uses same inputs) ────────────────────────
-    _invoke_chain(PROMPT_SKILLS_GAP, llm, parser, base)
+    _invoke_chain(PROMPT_SKILLS_GAP, llm_extract, parser, base)
 
     job_title = kw.get("job_title", "")
     for_summary = ", ".join(kw.get("for_summary", kw.get("jd_keywords", [])[:15]))
@@ -796,16 +838,16 @@ def run_pipeline(resume: str, jd: str) -> Dict:
     }
 
     # ── Step 3: Summary ──────────────────────────────────────────────
-    sm = safe_json(_invoke_chain(PROMPT_SUMMARY, llm, parser, w2_vars))
+    sm = safe_json(_invoke_chain(PROMPT_SUMMARY, llm_assemble, parser, w2_vars))
 
     # ── Step 4: Skills ───────────────────────────────────────────────
-    sk = safe_json(_invoke_chain(PROMPT_SKILLS, llm, parser, w2_vars))
+    sk = safe_json(_invoke_chain(PROMPT_SKILLS, llm_assemble, parser, w2_vars))
 
     # ── Step 5: Relevant Experience ──────────────────────────────────
-    re_exp = safe_json(_invoke_chain(PROMPT_RELEVANT_EXP, llm, parser, w2_vars))
+    re_exp = safe_json(_invoke_chain(PROMPT_RELEVANT_EXP, llm_assemble, parser, w2_vars))
 
     # ── Step 6: Projects ─────────────────────────────────────────────
-    pr = safe_json(_invoke_chain(PROMPT_PROJECTS, llm, parser, w2_vars))
+    pr = safe_json(_invoke_chain(PROMPT_PROJECTS, llm_assemble, parser, w2_vars))
 
     resume_text = assemble_resume(
         resume, sm, sk, pr,
@@ -816,10 +858,10 @@ def run_pipeline(resume: str, jd: str) -> Dict:
 
     # ── Step 7: Cold Email ───────────────────────────────────────────
     w3_vars = {"optimized_resume": resume_text, "jd": jd}
-    em = safe_json(_invoke_chain(PROMPT_EMAIL, llm, parser, w3_vars))
+    em = safe_json(_invoke_chain(PROMPT_EMAIL, llm_assemble, parser, w3_vars))
 
     # ── Step 8: Cover Letter ─────────────────────────────────────────
-    cv = safe_json(_invoke_chain(PROMPT_COVER, llm, parser, w3_vars))
+    cv = safe_json(_invoke_chain(PROMPT_COVER, llm_assemble, parser, w3_vars))
 
     return {
         "resume_text": resume_text,
@@ -1158,6 +1200,25 @@ def build_zip(r: bytes, c: bytes, e: bytes, ts: str) -> bytes:
 st.set_page_config(page_title="ATS Resume Builder v2", page_icon="📄", layout="wide")
 st.markdown("## 📄 ATS Resume Builder v2")
 
+with st.sidebar:
+    st.subheader("Groq models")
+    st.caption(
+        "**Extraction** — ATS keywords + skills gap. **Assembler** — summary, skills, "
+        "experience, projects, cold email, cover letter."
+    )
+    _ex_opts = _groq_select_options(GROQ_EXTRACTION_MODEL)
+    _asm_opts = _groq_select_options(GROQ_ASSEMBLER_MODEL)
+    extraction_model_ui = st.selectbox(
+        "Extraction model",
+        _ex_opts,
+        index=_groq_select_index(_ex_opts, GROQ_EXTRACTION_MODEL),
+    )
+    assembler_model_ui = st.selectbox(
+        "Assembler model",
+        _asm_opts,
+        index=_groq_select_index(_asm_opts, GROQ_ASSEMBLER_MODEL),
+    )
+
 if not GROQ_API_KEY:
     st.error("Set **GROQ_API_KEY** in your `.env` or environment variables.")
 
@@ -1178,7 +1239,12 @@ if go and up and jd.strip():
         up.seek(0)
         resume_plain = extract_text_from_docx(up)
         try:
-            out = run_pipeline(resume_plain, jd.strip())
+            out = run_pipeline(
+                resume_plain,
+                jd.strip(),
+                extraction_model=extraction_model_ui,
+                assembler_model=assembler_model_ui,
+            )
         except Exception as e:
             st.error(str(e))
             st.stop()

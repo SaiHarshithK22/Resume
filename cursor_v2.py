@@ -451,13 +451,25 @@ RESUME:
 {resume}
 """
 
-PROMPT_PROJECTS = """You are an ATS resume writer improving project bullets with JD keywords.
+PROMPT_PROJECTS = """You are an ATS resume writer tailoring the PROJECTS section to THIS job description.
+
+TARGET ROLE (from JD analysis):
+{job_title}
 
 JD KEYWORDS AVAILABLE:
 {for_bullets}
 
 MISSING KEYWORDS (not yet in resume — add where they naturally fit):
 {missing_keywords}
+
+═══ JD ALIGNMENT (PRIMARY) ═══
+- Order projects by relevance to THIS JD: put the project that best matches the JD's tools,
+  domain, and responsibilities FIRST; less relevant projects follow.
+- For each project, lead with bullets that map to the JD's top requirements (read the full JD).
+- Rewrite bullets so outcomes and tech explicitly echo JD language where truthful — same work,
+  stronger overlap with what the employer asked for.
+- If the JD stresses a stack (e.g. cloud, ML, LLMs, data pipelines), foreground that stack in
+  the matching project's bullets first.
 
 ═══ CRITICAL FORMAT ═══
 For EACH project, output EXACTLY this (header all on one line):
@@ -532,13 +544,26 @@ RESUME:
 {resume}
 """
 
-PROMPT_RELEVANT_EXP = """You are an ATS resume writer improving relevant experience bullets with JD keywords.
+PROMPT_RELEVANT_EXP = """You are an ATS resume writer tailoring the RELEVANT EXPERIENCE section to THIS job description.
 
-The RELEVANT EXPERIENCE section is a concise summary of the candidate's hands-on project work.
-Each bullet summarizes a major project in 1-2 lines.
+The RELEVANT EXPERIENCE section is a concise summary of hands-on work that should read as direct
+evidence the candidate can perform THIS role.
+
+TARGET ROLE (from JD analysis):
+{job_title}
 
 JD KEYWORDS AVAILABLE:
 {for_bullets}
+
+MISSING KEYWORDS (not yet in resume — add where they naturally fit):
+{missing_keywords}
+
+═══ JD ALIGNMENT (PRIMARY) ═══
+- Read the full JD: identify must-have tools, responsibilities, and domain; every bullet should
+  tie to at least one of them when the source material allows.
+- ORDER bullets by strength of match to the JD (most compelling evidence for this job first).
+- Reframe wording so responsibilities and outcomes mirror JD phrasing where truthful — do not
+  invent employers, dates, or work you cannot infer from the resume.
 
 ═══ CRITICAL FORMAT ═══
 Output EXACTLY this format (header all on one line):
@@ -887,7 +912,7 @@ def _add_border(para, color="000000", size=6):
     pPr.append(pBdr)
 
 
-def _hyperlink(paragraph, text: str, url: str, font_size=9.5):
+def _hyperlink(paragraph, text: str, url: str, font_size=11.0):
     r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
     hl = OxmlElement("w:hyperlink")
     hl.set(qn("r:id"), r_id)
@@ -912,7 +937,7 @@ def _hyperlink(paragraph, text: str, url: str, font_size=9.5):
     paragraph._p.append(hl)
 
 
-def _run(paragraph, text, size=10, bold=False, color=C_BLACK, italic=False):
+def _run(paragraph, text, size=11, bold=False, color=C_BLACK, italic=False):
     r = paragraph.add_run(text)
     r.bold = bold
     r.italic = italic
@@ -920,6 +945,83 @@ def _run(paragraph, text, size=10, bold=False, color=C_BLACK, italic=False):
     r.font.name = "Calibri"
     r.font.color.rgb = color
     return r
+
+
+# Cover letter / cold-email: http(s), www., emails, LinkedIn & GitHub words
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\)\]\>\"\']+|www\.[^\s\)\]\>\"\']+", re.I)
+_EMAIL_IN_TEXT_RE = re.compile(r"[\w\.\-]+@[\w\.\-]+\.\w+")
+_LI_GH_WORD_RE = re.compile(r"\b(LinkedIn|linkedin|GitHub|github)\b")
+
+
+def _trim_trailing_url_punct(url: str) -> str:
+    u = url.rstrip()
+    while u and u[-1] in ".,;:!?\"')\\]":
+        u = u[:-1]
+    return u
+
+
+def _link_fragments(text: str, lm: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Split text into (display, href). Empty href means plain text."""
+    if not text:
+        return []
+    out: List[Tuple[str, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m_url = _URL_IN_TEXT_RE.search(text, i)
+        m_em = _EMAIL_IN_TEXT_RE.search(text, i)
+        m_wd = _LI_GH_WORD_RE.search(text, i)
+        candidates: List[Tuple[int, str, re.Match]] = []
+        if m_url:
+            candidates.append((m_url.start(), "url", m_url))
+        if m_em:
+            candidates.append((m_em.start(), "em", m_em))
+        if m_wd:
+            candidates.append((m_wd.start(), "wd", m_wd))
+        if not candidates:
+            chunk = text[i:]
+            if chunk:
+                out.append((chunk, ""))
+            break
+        start, kind, m = min(candidates, key=lambda x: x[0])
+        if start > i:
+            out.append((text[i:start], ""))
+        if kind == "url":
+            raw = m.group(0)
+            trimmed = _trim_trailing_url_punct(raw)
+            href = trimmed
+            if href.lower().startswith("www."):
+                href = "https://" + href
+            if trimmed:
+                out.append((trimmed, href))
+            i = m.end()
+        elif kind == "em":
+            addr = m.group(0)
+            mail = lm.get("email", addr)
+            out.append((addr, f"mailto:{mail}"))
+            i = m.end()
+        else:
+            if m.group(1).lower() == "linkedin":
+                out.append(("LinkedIn", lm["linkedin"]))
+            else:
+                out.append(("GitHub", lm["github"]))
+            i = m.end()
+    return out
+
+
+def _add_paragraph_with_hyperlinks(
+    paragraph,
+    text: str,
+    font_size: float,
+    lm: Dict[str, str],
+) -> None:
+    for disp, href in _link_fragments(text, lm):
+        if not disp:
+            continue
+        if href:
+            _hyperlink(paragraph, disp, href, font_size)
+        else:
+            _run(paragraph, disp, size=font_size, color=C_BLACK)
 
 
 def _is_section(line: str) -> bool:
@@ -968,6 +1070,14 @@ def _unprotect(doc):
 
 # ── DOCX builders ─────────────────────────────────────────────────────────────
 
+# Resume .docx typography (pt) — name from first line of resume_text; contact row 12 pt;
+# section headings 11.5 pt; body (bullets, projects, skills, education, etc.) 11 pt.
+RESUME_NAME_PT = 18
+RESUME_CONTACT_PT = 12
+RESUME_SECTION_HEADING_PT = 11.5
+RESUME_BODY_PT = 11
+
+
 def build_resume_docx(resume_text: str) -> bytes:
     lm = LINK_MAP
     doc = DocxDocument()
@@ -975,7 +1085,7 @@ def build_resume_docx(resume_text: str) -> bytes:
         sec.top_margin = sec.bottom_margin = Inches(0.5)
         sec.left_margin = sec.right_margin = Inches(0.7)
     doc.styles["Normal"].font.name = "Calibri"
-    doc.styles["Normal"].font.size = Pt(10)
+    doc.styles["Normal"].font.size = Pt(RESUME_BODY_PT)
 
     lines = [l for l in resume_text.split("\n") if l.strip()]
     name_done = False
@@ -989,7 +1099,7 @@ def build_resume_docx(resume_text: str) -> bytes:
         if not name_done:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _run(p, line, size=18, bold=True, color=C_BLACK)
+            _run(p, line, size=RESUME_NAME_PT, bold=True, color=C_BLACK)
             p.paragraph_format.space_before = Pt(0)
             p.paragraph_format.space_after = Pt(2)
             name_done = True
@@ -1004,15 +1114,20 @@ def build_resume_docx(resume_text: str) -> bytes:
                 email_m = re.search(r"[\w\.\-]+@[\w\.\-]+\.\w+", part)
                 low = part.lower().strip()
                 if email_m:
-                    _hyperlink(p, part, f"mailto:{lm.get('email', email_m.group(0))}", 9)
+                    _hyperlink(
+                        p,
+                        part,
+                        f"mailto:{lm.get('email', email_m.group(0))}",
+                        RESUME_CONTACT_PT,
+                    )
                 elif "linkedin" in low:
-                    _hyperlink(p, "LinkedIn", lm["linkedin"], 9)
+                    _hyperlink(p, "LinkedIn", lm["linkedin"], RESUME_CONTACT_PT)
                 elif "github" in low:
-                    _hyperlink(p, "GitHub", lm["github"], 9)
+                    _hyperlink(p, "GitHub", lm["github"], RESUME_CONTACT_PT)
                 else:
-                    _run(p, part, size=9, color=C_GRAY)
+                    _run(p, part, size=RESUME_CONTACT_PT, color=C_GRAY)
                 if idx < len(parts) - 1:
-                    _run(p, " | ", size=9, color=C_GRAY)
+                    _run(p, " | ", size=RESUME_CONTACT_PT, color=C_GRAY)
             p.paragraph_format.space_after = Pt(2)
             hr = doc.add_paragraph()
             _add_border(hr, "000000", 8)
@@ -1025,7 +1140,7 @@ def build_resume_docx(resume_text: str) -> bytes:
         if _is_section(line):
             current_section = line.upper().strip().rstrip(":")
             p = doc.add_paragraph()
-            _run(p, current_section, size=10.5, bold=True, color=C_BLACK)
+            _run(p, current_section, size=RESUME_SECTION_HEADING_PT, bold=True, color=C_BLACK)
             p.paragraph_format.space_before = Pt(8)
             p.paragraph_format.space_after = Pt(2)
             _add_border(p, "000000", 6)
@@ -1045,7 +1160,7 @@ def build_resume_docx(resume_text: str) -> bytes:
             txt = re.sub(r"^[•·\-*▪◦]\s*", "", line)
             tab_stops = p.paragraph_format.tab_stops
             tab_stops.add_tab_stop(Inches(0.25))
-            _run(p, "•\t" + txt, size=9.5, color=C_BLACK)
+            _run(p, "•\t" + txt, size=RESUME_BODY_PT, color=C_BLACK)
             p.paragraph_format.left_indent = Inches(0.25)
             p.paragraph_format.first_line_indent = Inches(-0.25)
             p.paragraph_format.space_before = Pt(1)
@@ -1065,19 +1180,19 @@ def build_resume_docx(resume_text: str) -> bytes:
                 low = pp.lower().strip()
                 is_first = pidx == 0
                 if (low == "link" or low.startswith("link")) and proj_url:
-                    _hyperlink(p, pp, proj_url, 10)
+                    _hyperlink(p, pp, proj_url, RESUME_BODY_PT)
                 else:
-                    _run(p, pp, size=10, bold=is_first, color=C_BLACK)
+                    _run(p, pp, size=RESUME_BODY_PT, bold=is_first, color=C_BLACK)
                 if pidx < len(pipe_parts) - 1:
-                    _run(p, " | ", size=10, bold=False, color=C_BLACK)
+                    _run(p, " | ", size=RESUME_BODY_PT, bold=False, color=C_BLACK)
 
             if date_part:
                 tab_stops = p.paragraph_format.tab_stops
                 tab_stops.add_tab_stop(
                     Inches(6.6), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES
                 )
-                _run(p, "\t", size=10)
-                _run(p, date_part, size=9.5, bold=False, color=C_BLACK)
+                _run(p, "\t", size=RESUME_BODY_PT)
+                _run(p, date_part, size=RESUME_BODY_PT, bold=False, color=C_BLACK)
 
             p.paragraph_format.space_before = Pt(6)
             p.paragraph_format.space_after = Pt(1)
@@ -1091,17 +1206,17 @@ def build_resume_docx(resume_text: str) -> bytes:
             pipe_parts = [x.strip() for x in title_part.split("|")]
             for pidx, pp in enumerate(pipe_parts):
                 is_first = pidx == 0
-                _run(p, pp, size=10, bold=is_first, color=C_BLACK)
+                _run(p, pp, size=RESUME_BODY_PT, bold=is_first, color=C_BLACK)
                 if pidx < len(pipe_parts) - 1:
-                    _run(p, " | ", size=10, bold=False, color=C_BLACK)
+                    _run(p, " | ", size=RESUME_BODY_PT, bold=False, color=C_BLACK)
 
             if date_part:
                 tab_stops = p.paragraph_format.tab_stops
                 tab_stops.add_tab_stop(
                     Inches(6.6), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES
                 )
-                _run(p, "\t", size=10)
-                _run(p, date_part, size=9.5, bold=False, color=C_BLACK)
+                _run(p, "\t", size=RESUME_BODY_PT)
+                _run(p, date_part, size=RESUME_BODY_PT, bold=False, color=C_BLACK)
 
             p.paragraph_format.space_before = Pt(6)
             p.paragraph_format.space_after = Pt(1)
@@ -1114,8 +1229,8 @@ def build_resume_docx(resume_text: str) -> bytes:
             items = line[colon + 1:].strip()
             if cat and items:
                 p = doc.add_paragraph()
-                _run(p, cat + ":  ", size=10, bold=True, color=C_BLACK)
-                _run(p, items, size=10, color=C_DARK)
+                _run(p, cat + ":  ", size=RESUME_BODY_PT, bold=True, color=C_BLACK)
+                _run(p, items, size=RESUME_BODY_PT, color=C_DARK)
                 p.paragraph_format.space_before = Pt(1)
                 p.paragraph_format.space_after = Pt(1)
                 continue
@@ -1130,15 +1245,15 @@ def build_resume_docx(resume_text: str) -> bytes:
             if has_date:
                 text_part = line[:has_date.start()].strip().rstrip("|").strip()
                 date_part = has_date.group(1).strip()
-                _run(p, text_part, size=10, bold=is_inst, color=C_BLACK)
+                _run(p, text_part, size=RESUME_BODY_PT, bold=is_inst, color=C_BLACK)
                 tab_stops = p.paragraph_format.tab_stops
                 tab_stops.add_tab_stop(
                     Inches(6.6), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES
                 )
-                _run(p, "\t", size=10)
-                _run(p, date_part, size=9.5, bold=False, color=C_BLACK)
+                _run(p, "\t", size=RESUME_BODY_PT)
+                _run(p, date_part, size=RESUME_BODY_PT, bold=False, color=C_BLACK)
             else:
-                _run(p, line, size=10, bold=is_inst, color=C_BLACK)
+                _run(p, line, size=RESUME_BODY_PT, bold=is_inst, color=C_BLACK)
 
             p.paragraph_format.space_before = Pt(2)
             p.paragraph_format.space_after = Pt(1)
@@ -1146,7 +1261,7 @@ def build_resume_docx(resume_text: str) -> bytes:
 
         # ── Fallback — never bold ─────────────────────────────────────────
         p = doc.add_paragraph()
-        _run(p, line, size=10, bold=False, color=C_BLACK)
+        _run(p, line, size=RESUME_BODY_PT, bold=False, color=C_BLACK)
         p.paragraph_format.space_before = Pt(2)
         p.paragraph_format.space_after = Pt(1)
 
@@ -1158,6 +1273,7 @@ def build_resume_docx(resume_text: str) -> bytes:
 
 
 def build_cover_docx(cover_data: dict) -> bytes:
+    lm = LINK_MAP
     text = normalize(cover_data.get("cover_letter_text", ""))
     doc = DocxDocument()
     for sec in doc.sections:
@@ -1167,10 +1283,7 @@ def build_cover_docx(cover_data: dict) -> bytes:
     doc.styles["Normal"].font.size = Pt(11)
     for para_text in [p.strip() for p in text.split("\n") if p.strip()]:
         p = doc.add_paragraph()
-        r = p.add_run(para_text)
-        r.font.name = "Calibri"
-        r.font.size = Pt(11)
-        r.font.color.rgb = C_BLACK
+        _add_paragraph_with_hyperlinks(p, para_text, 11.0, lm)
         p.paragraph_format.space_after = Pt(8)
         p.paragraph_format.line_spacing = Pt(14)
     _unprotect(doc)
@@ -1291,8 +1404,3 @@ if go and up and jd.strip():
             mime="text/plain",
             use_container_width=True,
         )
-
-    st.subheader("Cold Email")
-    ed = out["email_data"]
-    st.text_input("Subject", value=ed.get("subject_line", ""), disabled=True)
-    st.text_area("Body", value=ed.get("email_body", ""), height=200, disabled=True)

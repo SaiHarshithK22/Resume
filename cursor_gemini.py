@@ -64,8 +64,8 @@ GEMINI_ASSEMBLER_MODEL = os.environ.get("GEMINI_ASSEMBLER_MODEL", GEMINI_MODEL).
 GEMINI_MODEL_CATALOG: List[str] = [
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
+    "Gemini 3.1 Flash-Lite",
+    "Gemini 3.1 Flash",
 ]
 
 

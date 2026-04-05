@@ -26,15 +26,13 @@ import zipfile
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-from dotenv import load_dotenv
+
 from docx import Document as DocxDocument
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
-
-load_dotenv()
 
 import streamlit as st
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -44,6 +42,8 @@ from langchain_core.prompts import ChatPromptTemplate
 # ── Config ────────────────────────────────────────────────────────────────────
 
 # Google AI Studio / Gemini: use GOOGLE_API_KEY or GEMINI_API_KEY
+from dotenv import load_dotenv
+load_dotenv()
 GEMINI_API_KEY = (
     os.environ.get("GOOGLE_API_KEY", "").strip()
     or os.environ.get("GEMINI_API_KEY", "").strip()

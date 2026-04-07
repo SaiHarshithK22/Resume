@@ -53,7 +53,7 @@ GEMINI_API_KEY = (
     os.environ.get("GEMINI_API_KEY", "").strip()
     or os.environ.get("GOOGLE_API_KEY", "").strip()
 )
-_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 # GEMINI_MODEL: default when GEMINI_EXTRACTION_MODEL / GEMINI_ASSEMBLER_MODEL are not set
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", _DEFAULT_GEMINI_MODEL).strip()
 # Extraction: ATS keywords + skills gap (steps 1–2). Assembler: summary → cover (steps 3–8).
@@ -128,9 +128,11 @@ RELEVANT_EXP_HEADERS = {
     "RELEVANT EXPERIENCE",
 }
 
+_MONTH = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+_DATE_START = rf"(?:{_MONTH}\s+\d{{4}}|\d{{1,2}}/\d{{4}}|\d{{4}})"
+_DATE_END   = rf"(?:Present|Current|Ongoing|{_MONTH}\s+\d{{4}}|\d{{1,2}}/\d{{4}}|\d{{4}})"
 DATE_RE = re.compile(
-    r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}"
-    r"\s*[–—-]\s*(?:Present|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}))\b",
+    rf"({_DATE_START}\s*[–—\-]\s*{_DATE_END})",
     re.IGNORECASE,
 )
 
@@ -150,11 +152,32 @@ DEGREE_KEYWORDS = {
 # ── Text helpers ──────────────────────────────────────────────────────────────
 
 def safe_json(text: str) -> dict:
-    text = re.sub(r"```json|```", "", text).strip()
+    if not text or not text.strip():
+        return {}
+    # Strip markdown fences
+    text = re.sub(r"```json\s*|```\s*", "", text).strip()
+    # Strip Gemini <think>…</think> blocks
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.I).strip()
+    # Attempt 1: direct parse
     try:
         return json.loads(text)
     except Exception:
-        return {}
+        pass
+    # Attempt 2: find the first { … } block (greedy)
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    # Attempt 3: fix common Gemini quirks (trailing commas)
+    if m:
+        cleaned = re.sub(r",\s*([}\]])", r"\1", m.group(0))
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+    return {}
 
 
 def extract_text_from_docx(uploaded_file) -> str:
@@ -284,7 +307,7 @@ def fix_project_bullets(text: str) -> str:
         if not s:
             out.append("")
             continue
-        is_header = ("|" in s and bool(DATE_RE.search(s))) or s.upper().rstrip(":") in SECTION_HEADERS
+        is_header = _is_project_header(s) or s.upper().rstrip(":") in SECTION_HEADERS
         is_already_bullet = bool(re.match(r"^[•·\-*▪◦]", s))
         if not is_header and not is_already_bullet and not s.startswith("|"):
             s = "• " + s
@@ -455,80 +478,81 @@ RESUME:
 {resume}
 """
 
-PROMPT_PROJECTS = """You are an ATS resume writer tailoring the PROJECTS section to THIS job description with mainly JD keywords.
+PROMPT_PROJECTS = """You are an ATS resume writer tailoring the PROJECTS section to THIS job description.
 
-TARGET ROLE (from JD analysis):
-{job_title}
+═══ JOB DESCRIPTION (read this FIRST — every bullet you write must connect to it) ═══
+{jd}
 
-JD KEYWORDS AVAILABLE:
-{for_bullets}
+═══ RESUME ═══
+{resume}
 
-MISSING KEYWORDS (not yet in resume — add where they naturally fit):
-{missing_keywords}
+═══ EXTRACTED JD CONTEXT ═══
+Target role: {job_title}
+JD keywords to weave in: {for_bullets}
+Missing keywords (not yet in resume): {missing_keywords}
 
 ═══ JD ALIGNMENT (PRIMARY) ═══
-- Order projects by relevance to THIS JD: put the project that best matches the JD's tools,
-  domain, and responsibilities FIRST; less relevant projects follow.
-- For each project, lead with bullets that map to the JD's top requirements (read the full JD).
-- Rewrite bullets so outcomes and tech explicitly echo JD language where truthful — same work,
-  stronger overlap with what the employer asked for.
+- Order projects by relevance to the JD above: best-matching project FIRST.
+- For each project, lead with bullets that map to the JD's top requirements.
+- Rewrite bullets so outcomes and tech explicitly echo JD language where truthful.
 - If the JD stresses a stack (e.g. cloud, ML, LLMs, data pipelines), foreground that stack in
   the matching project's bullets first.
 
 ═══ CRITICAL FORMAT ═══
-For EACH project, output EXACTLY this (header all on one line):
-ProjectName | TechStack | Link                DateRange
+For EACH project use EXACTLY this layout (header + date on ONE line, then bullets):
+
+ProjectName | TechStack | Link                Mon YYYY – Mon YYYY
 • bullet 1
 • bullet 2
 • bullet 3
 • bullet 4
-• bullet 5
+
+IMPORTANT: The date range (e.g. "Jan 2024 – Present") MUST appear at the RIGHT END of the
+header line, separated by spaces — NOT on a separate line. Copy dates exactly from resume.
+Every bullet line MUST start with the • character.
 
 ═══ RULES ═══
 1. Keep project names, tech stacks, and date ranges EXACTLY as in the resume.
-2. Start EVERY bullet with a strong action verb.
+2. Start EVERY bullet with "• " followed by a strong action verb.
 3. Each bullet should include 1-2 JD keywords WHERE THEY NATURALLY FIT.
-   Do NOT force keywords that make the bullet unreadable.
-4. PRESERVE the original meaning of each bullet — describe what the project ACTUALLY does.
-   Do NOT fabricate capabilities the project doesn't have.
+4. PRESERVE the original meaning — describe what the project ACTUALLY does.
 5. Preserve ALL original metrics, numbers, percentages. Never invent metrics.
 6. Each project: 4-5 bullets. Rewrite existing bullets; do not add imaginary ones.
 7. Do NOT include Education or Certifications.
 8. Include "| Link" after tech stack for projects with deployable links.
-9. The bullets must read naturally — a human reviewer should not notice keyword stuffing.
-10. NEVER add phrases like "20 hours per week", "handoff docs", "business owners",
-    "nontechnical stakeholders", "deployable artifacts" into bullets — these are not technical work.
+9. Bullets must read naturally — no keyword stuffing.
 
 Return ONLY valid JSON (no markdown fences):
 {{
   "projects_text": "full plain-text PROJECTS block following the format above"
-}}
-
-JOB DESCRIPTION:
-{jd}
-
-RESUME:
-{resume}
-"""
+}}"""
 
 PROMPT_EXPERIENCE = """You are an ATS resume writer improving work experience bullets with JD keywords.
 
-JD KEYWORDS AVAILABLE:
-{for_bullets}
+═══ JOB DESCRIPTION (read this FIRST — tailor bullets to this role) ═══
+{jd}
 
-MISSING KEYWORDS (not yet in resume — add where they naturally fit):
-{missing_keywords}
+═══ RESUME ═══
+{resume}
+
+═══ EXTRACTED JD CONTEXT ═══
+JD keywords to weave in: {for_bullets}
+Missing keywords (not yet in resume): {missing_keywords}
 
 ═══ CRITICAL FORMAT ═══
-For EACH role, output EXACTLY this (header all on one line):
-Job Title | Company Name                DateRange
+For EACH role, use EXACTLY this layout (header + date on ONE line, then bullets):
+
+Job Title | Company Name                Mon YYYY – Mon YYYY
 • bullet 1
 • bullet 2
 • bullet 3
 
+IMPORTANT: The date range MUST appear at the RIGHT END of the header line, separated by spaces.
+Every bullet line MUST start with the • character.
+
 ═══ RULES ═══
 1. Keep job titles, company names, locations, and date ranges EXACTLY as in the resume.
-2. Start EVERY bullet with a strong action verb.
+2. Start EVERY bullet with "• " followed by a strong action verb.
 3. Each bullet should include 1-2 JD keywords WHERE THEY NATURALLY FIT.
 4. PRESERVE the original meaning — describe what the candidate ACTUALLY did.
 5. Preserve ALL original metrics, numbers, percentages. Never invent metrics.
@@ -539,47 +563,44 @@ Job Title | Company Name                DateRange
 Return ONLY valid JSON (no markdown fences):
 {{
   "experience_text": "full plain-text WORK EXPERIENCE block following the format above"
-}}
+}}"""
 
-JOB DESCRIPTION:
+PROMPT_RELEVANT_EXP = """You are an ATS resume writer tailoring the RELEVANT EXPERIENCE section to THIS job description.
+
+═══ JOB DESCRIPTION (read this FIRST — every bullet you write must connect to it) ═══
 {jd}
 
-RESUME:
+═══ RESUME ═══
 {resume}
-"""
 
-PROMPT_RELEVANT_EXP = """You are an ATS resume writer tailoring the RELEVANT EXPERIENCE section to THIS job description with mainly JD keywords.
-
-The RELEVANT EXPERIENCE section is a concise summary of hands-on work that should read as direct
-evidence the candidate can perform THIS role.
-
-TARGET ROLE (from JD analysis):
-{job_title}
-
-JD KEYWORDS AVAILABLE:
-{for_bullets}
-
-MISSING KEYWORDS (not yet in resume — add where they naturally fit):
-{missing_keywords}
+═══ EXTRACTED JD CONTEXT ═══
+Target role: {job_title}
+JD keywords to weave in: {for_bullets}
+Missing keywords (not yet in resume): {missing_keywords}
 
 ═══ JD ALIGNMENT (PRIMARY) ═══
-- Read the full JD: identify must-have tools, responsibilities, and domain; every bullet should
-  tie to at least one of them when the source material allows.
+- Identify the JD's must-have tools, responsibilities, and domain from above.
+- Every bullet should tie to at least one JD requirement when the source material allows.
 - ORDER bullets by strength of match to the JD (most compelling evidence for this job first).
 - Reframe wording so responsibilities and outcomes mirror JD phrasing where truthful — do not
   invent employers, dates, or work you cannot infer from the resume.
 
 ═══ CRITICAL FORMAT ═══
-Output EXACTLY this format (header all on one line):
-Title | Organization                DateRange
+Use EXACTLY this layout (header + date on ONE line, then bullets):
+
+Title | Organization                Mon YYYY – Mon YYYY
 • bullet 1
 • bullet 2
 • bullet 3
 • bullet 4
 
+IMPORTANT: The date range (e.g. "Jan 2024 – Present") MUST appear at the RIGHT END of the
+header line, separated by spaces — NOT on a separate line. Copy dates exactly from resume.
+Every bullet line MUST start with the • character.
+
 ═══ RULES ═══
 1. Keep the title, organization, and date range EXACTLY as in the resume.
-2. Start each bullet with a strong action verb (Built, Developed, Designed, Engineered, Deployed).
+2. Start each bullet with "• " followed by a strong action verb (Built, Developed, Designed, Deployed).
 3. Include 1-2 JD keywords per bullet WHERE THEY NATURALLY FIT.
 4. Preserve ALL original metrics, numbers, percentages. Never invent metrics.
 5. Keep bullets concise — each bullet is a 1-2 line summary of a project.
@@ -590,24 +611,20 @@ Title | Organization                DateRange
 Return ONLY valid JSON (no markdown fences):
 {{
   "relevant_exp_text": "full plain-text RELEVANT EXPERIENCE block following the format above"
-}}
-
-JOB DESCRIPTION:
-{jd}
-
-RESUME:
-{resume}
-"""
+}}"""
 
 # ── Wave 3: Email + Cover (uses assembled resume) ───────────────────────────
 
 PROMPT_EMAIL = """You are an expert at writing cold outreach emails to recruiters and hiring managers.
 
-IMPORTANT: The resume below is already ATS-optimized and tailored to the JD.
-Use it as the definitive source. Never invent facts.
+═══ JOB DESCRIPTION (read this FIRST — reference the company, role, and stack in your email) ═══
+{jd}
 
-Rules:
-1. Subject line: mention the exact job title + be curiosity-driving (not generic).
+═══ OPTIMIZED RESUME ═══
+{optimized_resume}
+
+═══ RULES ═══
+1. Subject line: mention the exact job title from the JD above + be curiosity-driving (not generic).
 2. Opening: reference something specific from the company or JD — NOT "I saw your job posting".
 3. Body: 2 short paragraphs max.
    - Para 1: who the candidate is + ONE most impressive quantified achievement from the resume
@@ -622,21 +639,17 @@ Return ONLY valid JSON (no markdown fences):
 {{
   "subject_line": "...",
   "email_body": "full email text including sign-off"
-}}
-
-JOB DESCRIPTION:
-{jd}
-
-OPTIMIZED RESUME:
-{optimized_resume}
-"""
+}}"""
 
 PROMPT_COVER = """You are a professional cover letter writer who specializes in ATS-optimized, human-readable letters.
 
-IMPORTANT: The resume below is already ATS-optimized and tailored to the JD.
-Use it as the definitive source. All keywords and achievements MUST come from this resume.
+═══ JOB DESCRIPTION (read this FIRST — the cover letter must be specific to this role and company) ═══
+{jd}
 
-Rules:
+═══ OPTIMIZED RESUME ═══
+{optimized_resume}
+
+═══ RULES ═══
 1. Header: candidate's full contact info from the resume (Name, City, Phone, Email, LinkedIn, GitHub).
 2. Date: use today's date.
 3. Salutation: "Dear Hiring Manager," (unless a specific name is in the JD).
@@ -662,14 +675,7 @@ Rules:
 Return ONLY valid JSON (no markdown fences):
 {{
   "cover_letter_text": "full formatted cover letter including header and sign-off"
-}}
-
-JOB DESCRIPTION:
-{jd}
-
-OPTIMIZED RESUME:
-{optimized_resume}
-"""
+}}"""
 
 
 # ── Assembler ─────────────────────────────────────────────────────────────────
@@ -852,11 +858,25 @@ def run_pipeline(
     _invoke_chain(PROMPT_SKILLS_GAP, llm_extract, parser, base)
 
     job_title = kw.get("job_title", "")
-    for_summary = ", ".join(kw.get("for_summary", kw.get("jd_keywords", [])[:15]))
-    for_skills = ", ".join(kw.get("for_skills", kw.get("jd_keywords", [])))
-    for_bullets = ", ".join(kw.get("for_bullets", kw.get("jd_keywords", [])))
+    jd_kws = kw.get("jd_keywords", [])
+    for_summary = ", ".join(kw.get("for_summary", jd_kws[:15]))
+    for_skills = ", ".join(kw.get("for_skills", jd_kws))
+    for_bullets = ", ".join(kw.get("for_bullets", jd_kws))
     missing_kws = ", ".join(kw.get("missing", []))
     missing_list = kw.get("missing", [])
+
+    # Fallback: if keyword extraction returned nothing useful, pull basics from JD
+    kw_extraction_ok = bool(job_title or for_bullets)
+    if not kw_extraction_ok:
+        # Try to grab the job title from the first non-empty line
+        for _line in jd.splitlines():
+            _s = _line.strip()
+            if _s and len(_s) < 120:
+                job_title = _s
+                break
+        for_summary = for_skills = for_bullets = "(see full JD above)"
+        missing_kws = ""
+
     w2_vars = {
         **base,
         "job_title": job_title,
@@ -896,6 +916,13 @@ def run_pipeline(
         "resume_text": resume_text,
         "email_data": em,
         "cover_data": cv,
+        "_debug": {
+            "kw_extraction_ok": kw_extraction_ok,
+            "job_title": job_title,
+            "for_bullets": for_bullets,
+            "missing_keywords": missing_kws,
+            "kw_raw_snippet": kw_raw[:500] if kw_raw else "(empty)",
+        },
     }
 
 
@@ -1033,7 +1060,13 @@ def _is_section(line: str) -> bool:
 
 
 def _is_project_header(line: str) -> bool:
-    return "|" in line and not _is_section(line)
+    if _is_section(line) or _is_bullet(line):
+        return False
+    if "|" in line:
+        return True
+    if DATE_RE.search(line) and len(line) < 200:
+        return True
+    return False
 
 
 def _is_bullet(line: str) -> bool:
@@ -1373,6 +1406,18 @@ if go and up and jd.strip():
     zip_bytes = build_zip(r_bytes, cv_bytes, em_bytes, ts)
 
     st.success("Done! Files are fully editable — if Word shows 'Protected View', click **Enable Editing**.")
+
+    dbg = out.get("_debug", {})
+    with st.expander("🔍 Keyword Extraction Debug", expanded=not dbg.get("kw_extraction_ok", True)):
+        if dbg.get("kw_extraction_ok"):
+            st.info("Keyword extraction succeeded.")
+        else:
+            st.warning("Keyword extraction failed — used fallback (JD title + full JD text). "
+                       "Output quality may be reduced. Try a different extraction model.")
+        st.markdown(f"**Job title:** {dbg.get('job_title', '(none)')}")
+        st.markdown(f"**Keywords for bullets:** {dbg.get('for_bullets', '(none)')}")
+        st.markdown(f"**Missing keywords:** {dbg.get('missing_keywords', '(none)')}")
+        st.text_area("Raw keyword extraction (first 500 chars)", dbg.get("kw_raw_snippet", ""), height=120)
 
     st.download_button(
         "⬇️  Download All (.zip)",
